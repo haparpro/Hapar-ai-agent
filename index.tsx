@@ -15,8 +15,6 @@ interface ChatSession {
 }
 
 const App = () => {
-  const [ai, setAi] = useState<GoogleGenAI | null>(null);
-  const [chat, setChat] = useState<Chat | null>(null);
   const [chatSessions, setChatSessions] = useState<Record<string, ChatSession>>({});
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [inputValue, setInputValue] = useState('');
@@ -27,8 +25,11 @@ const App = () => {
   const [isInIframe, setIsInIframe] = useState(false);
   const [previewSrcDoc, setPreviewSrcDoc] = useState<string | undefined>(undefined);
   const [mode, setMode] = useState<'chat' | 'build'>('chat');
+  const [apiKeyReady, setApiKeyReady] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const thinkingModeRef = useRef(thinkingMode);
+  const apiKeyReadyRef = useRef(apiKeyReady);
   
   const activeMessages = activeChatId ? chatSessions[activeChatId]?.messages : [];
 
@@ -56,15 +57,27 @@ const App = () => {
     }
   }, []);
   
-  // Initialize AI
+  // Check for selected API key on mount
   useEffect(() => {
-    try {
-      const genAI = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      setAi(genAI);
-    } catch (error) {
-      console.error("Failed to initialize GoogleGenAI:", error);
-      // Handle error gracefully
-    }
+    const checkApiKey = async () => {
+        try {
+            if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function') {
+                const hasKey = await window.aistudio.hasSelectedApiKey();
+                setApiKeyReady(hasKey);
+                apiKeyReadyRef.current = hasKey;
+            } else {
+                // In environments where aistudio is not available, assume key is present via env
+                setApiKeyReady(true);
+                apiKeyReadyRef.current = true;
+            }
+        } catch (e) {
+            console.error("Error checking for API key, assuming it's set.", e);
+            // Assume key is available to not block app in case of unexpected error
+            setApiKeyReady(true);
+            apiKeyReadyRef.current = true;
+        }
+    };
+    checkApiKey();
   }, []);
   
   useEffect(() => {
@@ -75,13 +88,14 @@ const App = () => {
     }
   }, []);
 
-  // Initialize Chat when AI, mode, or active chat changes
   useEffect(() => {
     thinkingModeRef.current = thinkingMode;
-    if (ai && activeChatId) {
-      initializeChat();
-    }
-  }, [ai, thinkingMode, activeChatId, chatSessions]);
+  }, [thinkingMode]);
+  
+  useEffect(() => {
+    apiKeyReadyRef.current = apiKeyReady;
+  }, [apiKeyReady]);
+
 
   // Scroll to bottom of chat
   useEffect(() => {
@@ -102,28 +116,30 @@ const App = () => {
     }
   }, [chatSessions, activeChatId, isLoading]);
   
-  const initializeChat = () => {
-    if (!ai || !activeChatId || !chatSessions[activeChatId]) return;
-
-    const model = thinkingModeRef.current ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
-    const config = thinkingModeRef.current ? { thinkingConfig: { thinkingBudget: 32768 } } : {};
-    
-    const history = chatSessions[activeChatId].messages.map(msg => ({
-        role: msg.role,
-        parts: [{ text: msg.text }]
-    }));
-
-    // Remove last message if it's an incomplete model response
-    if (history.length > 0 && history[history.length - 1].role === 'model' && isLoading) {
-      history.pop();
+  const ensureApiKey = async () => {
+    if (apiKeyReadyRef.current) {
+        return true;
     }
-
-    const newChat = ai.chats.create({
-        model: model,
-        config: config,
-        history: history,
-    });
-    setChat(newChat);
+    try {
+        if (window.aistudio && typeof window.aistudio.openSelectKey === 'function') {
+            await window.aistudio.openSelectKey();
+            // Assume success to handle race condition, as per guidelines.
+            setApiKeyReady(true);
+            apiKeyReadyRef.current = true;
+            return true;
+        }
+        // If aistudio is not available, we can't prompt the user.
+        // We proceed assuming the key is in process.env.API_KEY.
+        return true; 
+    } catch (e) {
+        if (e.message && e.message.includes('dialog closed')) {
+             console.log('User closed API key selection dialog.');
+             return false;
+        }
+        console.error("Error opening API key selection:", e);
+        alert("An error occurred while trying to select an API key. Please check the console and try again.");
+        return false;
+    }
   };
   
   const handleNewChat = () => {
@@ -135,10 +151,16 @@ const App = () => {
     };
     setChatSessions(prev => ({...prev, [newId]: newChatSession}));
     setActiveChatId(newId);
+    if (window.innerWidth <= 768) {
+        setIsSidebarOpen(false);
+    }
   };
 
   const handleSelectChat = (chatId: string) => {
     setActiveChatId(chatId);
+    if (window.innerWidth <= 768) {
+        setIsSidebarOpen(false);
+    }
   };
 
   const handleThinkingModeChange = () => {
@@ -184,7 +206,7 @@ const App = () => {
   
   const handleDownloadManifestClick = async () => {
     try {
-      const response = await fetch('/AndroidManifest.xml');
+      const response = await fetch('AndroidManifest.xml');
       if (!response.ok) {
         throw new Error(`Failed to fetch manifest: ${response.statusText}`);
       }
@@ -205,13 +227,19 @@ const App = () => {
   };
 
   const handleBuildRequest = async () => {
-    if (!inputValue.trim() || isLoading || !ai) return;
+    if (!inputValue.trim() || isLoading) return;
+
+    const keyReady = await ensureApiKey();
+    if (!keyReady) {
+      return;
+    }
 
     const currentInput = inputValue;
     setInputValue('');
     setIsLoading(true);
 
     try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         const fullPrompt = `You are a world-class frontend engineer. Create a single, self-contained HTML file including all necessary CSS and JavaScript based on the following user request. The output must be only the raw HTML code, starting with <!DOCTYPE html>. Do not wrap it in markdown or any other formatting. User request: "${currentInput}"`;
 
         const response = await ai.models.generateContent({
@@ -232,8 +260,15 @@ const App = () => {
 
     } catch (error) {
         console.error("Error building app:", error);
-        const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred.';
-        alert(`Sorry, the build failed: ${errorMessage}`);
+        const errorString = error instanceof Error ? error.message : JSON.stringify(error);
+        if (errorString.includes("PERMISSION_DENIED") || errorString.includes("API key not valid")) {
+            alert("There was an issue with your API Key. It might be invalid or lack the necessary permissions. Please select a valid key and try again.");
+            setApiKeyReady(false);
+            apiKeyReadyRef.current = false;
+        } else {
+            const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred.';
+            alert(`Sorry, the build failed: ${errorMessage}`);
+        }
     } finally {
         setIsLoading(false);
     }
@@ -249,13 +284,19 @@ const App = () => {
   }
 
   const handleSendMessage = async () => {
-    if (!inputValue.trim() || isLoading || !chat || !activeChatId) return;
+    if (!inputValue.trim() || isLoading || !activeChatId) return;
+    
+    const keyReady = await ensureApiKey();
+    if (!keyReady) {
+        return;
+    }
 
     const userMessage: Message = { role: 'user', text: inputValue };
     const currentInput = inputValue;
+    const currentChatSession = chatSessions[activeChatId];
 
-    const isFirstMessage = chatSessions[activeChatId].messages.length === 0;
-    const newTitle = isFirstMessage ? currentInput.substring(0, 30) + (currentInput.length > 30 ? '...' : '') : chatSessions[activeChatId].title;
+    const isFirstMessage = currentChatSession.messages.length === 0;
+    const newTitle = isFirstMessage ? currentInput.substring(0, 30) + (currentInput.length > 30 ? '...' : '') : currentChatSession.title;
 
     setChatSessions(prev => ({
         ...prev,
@@ -270,6 +311,21 @@ const App = () => {
     setIsLoading(true);
 
     try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const model = thinkingModeRef.current ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
+        const config = thinkingModeRef.current ? { thinkingConfig: { thinkingBudget: 32768 } } : {};
+        
+        const history = currentChatSession.messages.map(msg => ({
+            role: msg.role,
+            parts: [{ text: msg.text }]
+        }));
+
+        const chat = ai.chats.create({
+            model: model,
+            config: config,
+            history: history,
+        });
+        
         const stream = await chat.sendMessageStream({ message: currentInput });
         
         let modelResponse = '';
@@ -298,18 +354,25 @@ const App = () => {
         }
     } catch (error) {
         console.error("Error sending message:", error);
-        const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred.';
-        setChatSessions(prev => {
-            const currentMessages = [...prev[activeChatId].messages];
-            currentMessages[currentMessages.length - 1] = { role: 'model', text: `Sorry, something went wrong. ${errorMessage}` };
-             return {
-                    ...prev,
-                    [activeChatId]: {
-                        ...prev[activeChatId],
-                        messages: currentMessages,
-                    }
-                };
-        });
+        const errorString = error instanceof Error ? error.message : JSON.stringify(error);
+
+        if (errorString.includes("PERMISSION_DENIED") || errorString.includes("API key not valid")) {
+            alert("There was an issue with your API Key. It might be invalid or lack the necessary permissions. Please select a valid key and try again.");
+            setApiKeyReady(false);
+            apiKeyReadyRef.current = false;
+            // Revert optimistic UI updates
+            setChatSessions(prev => ({ ...prev, [activeChatId]: currentChatSession }));
+            setInputValue(currentInput);
+        } else {
+            const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred.';
+            setChatSessions(prev => ({
+                ...prev,
+                [activeChatId]: {
+                    ...prev[activeChatId],
+                    messages: [...prev[activeChatId].messages, { role: 'model', text: `Sorry, something went wrong. ${errorMessage}` }],
+                }
+            }));
+        }
     } finally {
         setIsLoading(false);
     }
@@ -330,6 +393,7 @@ const App = () => {
 
         .app-container { display: flex; flex-direction: column; height: 100vh; flex-grow: 1; }
         .header { background-color: var(--surface-color); padding: 1rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; z-index: 10;}
+        .header-left { display: flex; align-items: center; gap: 1rem; }
         .header h1 { font-size: 1.25rem; margin: 0; color: var(--text-color); }
         .header-controls { display: flex; align-items: center; gap: 1rem; }
         .chat-container { flex-grow: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; }
@@ -385,9 +449,52 @@ const App = () => {
         .apk-modal-content code { background-color: var(--model-message-bg); padding: 2px 6px; border-radius: 4px; font-family: 'Courier New', Courier, monospace; color: var(--text-color); }
         .apk-modal-content ol { padding-left: 1.5rem; }
         .apk-modal-content .manifest-button { background-color: var(--primary-color); color: white; border-color: var(--primary-color); margin-top: 0.5rem; }
+
+        .menu-btn { display: none; background: none; border: none; color: var(--text-color); cursor: pointer; padding: 0; }
+        .close-sidebar-btn { display: none; position: absolute; top: 1rem; right: 1rem; background: none; border: none; color: var(--text-color); cursor: pointer; z-index: 1000; }
+        .sidebar-backdrop { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); z-index: 998; }
+
+        @media (max-width: 768px) {
+            .sidebar {
+                position: fixed;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                height: 100%;
+                z-index: 999;
+                transform: translateX(-100%);
+                transition: transform 0.3s ease-in-out;
+                box-shadow: 4px 0 15px rgba(0,0,0,0.2);
+            }
+            .sidebar.open {
+                transform: translateX(0);
+            }
+            .close-sidebar-btn {
+                display: block;
+            }
+            .menu-btn {
+                display: block;
+            }
+            .header h1 {
+                font-size: 1.1rem;
+            }
+            .header-controls {
+                gap: 0.5rem;
+            }
+            .header-button {
+                padding: 0.4rem 0.8rem;
+                font-size: 0.8rem;
+            }
+            .mode-toggle-label {
+                display: none;
+            }
+        }
       `}</style>
       <div className="app-wrapper">
-          <aside className="sidebar">
+          <aside className={`sidebar ${isSidebarOpen ? 'open' : ''}`}>
+              <button className="close-sidebar-btn" onClick={() => setIsSidebarOpen(false)}>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+              </button>
               <div className="sidebar-header">
                 <button className="new-chat-btn" onClick={handleNewChat}>
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
@@ -410,7 +517,12 @@ const App = () => {
           <div className="app-container">
             {!isInIframe && (
                 <header className="header">
-                    <h1>Gemini Assistant</h1>
+                    <div className="header-left">
+                        <button className="menu-btn" onClick={() => setIsSidebarOpen(true)}>
+                           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+                        </button>
+                        <h1>Gemini Assistant</h1>
+                    </div>
                     <div className="header-controls">
                         <div className="mode-toggle" onClick={handleThinkingModeChange} title="Toggle between fast responses and deeper reasoning. Clears current conversation.">
                             <span className="mode-toggle-label">{thinkingMode ? 'Pro' : 'Flash'}</span>
@@ -465,7 +577,8 @@ const App = () => {
             </div>
           </div>
       </div>
-       {showPreview && (
+      {isSidebarOpen && <div className="sidebar-backdrop" onClick={() => setIsSidebarOpen(false)}></div>}
+      {showPreview && (
         <div className="preview-modal-overlay" onClick={handleClosePreview}>
           <div className="preview-modal-content" onClick={(e) => e.stopPropagation()}>
             <div className="phone-bezel">
